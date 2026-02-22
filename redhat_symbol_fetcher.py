@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import argparse
 import re
 import subprocess
 import sys
@@ -33,6 +34,11 @@ def need_tool(name: str, apt_pkg: str | None = None):
         raise RuntimeError(msg)
 
 
+SUPPORTED_PROVIDERS: dict[str, dict[str, str]] = {
+    "oracle-el7": {"debuginfo_base_url": ORACLE_OL7_DEBUGINFO},
+}
+
+
 def parse_banner(line: str) -> dict:
     # Works with: "0x... Linux version 3.10.0-... (...)"
     m = re.search(r"Linux version ([0-9A-Za-z.\-_]+)", line)
@@ -47,16 +53,35 @@ def parse_banner(line: str) -> dict:
     return {"kernel": kernel, "vendor": vendor, "distro": distro}
 
 
-def build_debuginfo_url(info: dict) -> str:
+def build_debuginfo_url(info: dict, provider: str | None = None, base_url: str | None = None) -> str:
     kernel = info["kernel"]
+
+    if base_url:
+        return f"{base_url.rstrip('/')}/kernel-debuginfo-{kernel}.rpm"
+
+    if provider:
+        if provider not in SUPPORTED_PROVIDERS:
+            raise NotImplementedError(
+                f"Unsupported provider: {provider}. Supported: {', '.join(sorted(SUPPORTED_PROVIDERS))}"
+            )
+        prov_base = SUPPORTED_PROVIDERS[provider]["debuginfo_base_url"]
+        return f"{prov_base.rstrip('/')}/kernel-debuginfo-{kernel}.rpm"
+
     if info["vendor"] == "oracle" and info["distro"] == "el7":
         return f"{ORACLE_OL7_DEBUGINFO}/kernel-debuginfo-{kernel}.rpm"
-    raise NotImplementedError(f"Unsupported vendor/distro for now: {info}")
+
+    raise NotImplementedError(
+        f"Cannot infer debuginfo provider from banner. Parsed: {info}\n"
+        f"Use --provider one of: {', '.join(sorted(SUPPORTED_PROVIDERS))} or --debuginfo-base-url"
+    )
 
 
 def wget_spider(url: str):
     # Check URL exists
-    run(["wget", "--spider", "-q", url])
+    try:
+        run(["wget", "--spider", "-q", url])
+    except RuntimeError as e:
+        raise RuntimeError(f"URL check failed: {url}\n{e}")
 
 
 def download(url: str, out_path: Path) -> Path:
@@ -82,12 +107,33 @@ def extract_rpm(rpm_path: Path, extract_dir: Path):
     extract_dir.mkdir(parents=True, exist_ok=True)
     print("[+] Extracting RPM (rpm2cpio | cpio)")
 
-    rpm_abs = rpm_path.resolve() 
+    rpm_abs = rpm_path.resolve()
 
-    cmd = f"rpm2cpio '{rpm_abs}' | cpio -idmv"
-    run(cmd, cwd=extract_dir, shell=True)
+    p1 = subprocess.Popen(
+        ["rpm2cpio", str(rpm_abs)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=False,
+    )
+    p2 = subprocess.Popen(
+        ["cpio", "-idmv"],
+        cwd=extract_dir,
+        stdin=p1.stdout,
+        stdout=None,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if p1.stdout is not None:
+        p1.stdout.close()
 
-    
+    _, p2_err = p2.communicate()
+    p1_err = p1.stderr.read().decode(errors="replace") if p1.stderr else ""
+    p1_rc = p1.wait()
+
+    if p1_rc != 0:
+        raise RuntimeError(f"rpm2cpio failed for: {rpm_abs}\n{p1_err.strip()}")
+    if p2.returncode != 0:
+        raise RuntimeError(f"cpio failed while extracting: {rpm_abs}\n{(p2_err or '').strip()}")
 
 
 def find_vmlinux(extract_dir: Path) -> Path:
@@ -128,19 +174,80 @@ def build_symbols(dwarf2json_path: Path, vmlinux: Path, kernel: str, vol_symbols
     return out_json
 
 
+def read_banner_from_args(args: argparse.Namespace) -> str:
+    if args.banner:
+        return args.banner.strip()
+    if args.banner_file:
+        p = Path(args.banner_file)
+        text = p.read_text(encoding="utf-8", errors="replace")
+        line = text.splitlines()[0].strip() if text.splitlines() else ""
+        return line
+    return ""
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        description="Download debuginfo RPM and build Volatility 3 Linux symbols JSON via dwarf2json."
+    )
+    p.add_argument("--banner", help="One kernel banner line containing 'Linux version ...'")
+    p.add_argument("--banner-file", help="Path to a text file whose first line is the banner")
+    p.add_argument(
+        "--provider",
+        choices=sorted(SUPPORTED_PROVIDERS.keys()),
+        help="Force a known debuginfo provider",
+    )
+    p.add_argument(
+        "--debuginfo-base-url",
+        help="Override debuginfo base URL (e.g. https://.../debuginfo)",
+    )
+    p.add_argument(
+        "--dwarf2json",
+        default=str(Path("./dwarf2json/dwarf2json")),
+        help="Path to dwarf2json binary (default: ./dwarf2json/dwarf2json)",
+    )
+    p.add_argument(
+        "--symbols-dir",
+        default=str(Path("./symbols")),
+        help="Volatility symbols directory root (default: ./symbols)",
+    )
+    p.add_argument(
+        "--workdir",
+        default=str(Path("./symbol_work")),
+        help="Working directory for downloads/extraction (default: ./symbol_work)",
+    )
+    p.add_argument(
+        "--list-providers",
+        action="store_true",
+        help="List supported providers and exit",
+    )
+    return p
+
+
 def main():
+    args = build_arg_parser().parse_args()
+
+    if args.list_providers:
+        for name in sorted(SUPPORTED_PROVIDERS):
+            print(name)
+        return
+
     # prerequisites
     need_tool("wget", "wget")
     need_tool("rpm2cpio", "rpm2cpio")
     need_tool("cpio", "cpio")
 
    
-    dwarf2json_path = Path("./dwarf2json/dwarf2json")
+    dwarf2json_path = Path(args.dwarf2json)
     if not dwarf2json_path.exists():
-        raise RuntimeError("Cannot find ./dwarf2json.\nBuild it:\n  git clone https://github.com/volatilityfoundation/dwarf2json.git\n  cd dwarf2json && go build -o dwarf2json .\n  cp dwarf2json <сюда>")
+        raise RuntimeError(
+            "Cannot find dwarf2json binary at: "
+            f"{dwarf2json_path}\nBuild it:\n  git clone https://github.com/volatilityfoundation/dwarf2json.git\n  cd dwarf2json && go build -o dwarf2json ."
+        )
 
-    print("[*] Paste ONE line from banners and press Enter:")
-    banner_line = sys.stdin.readline().strip()
+    banner_line = read_banner_from_args(args)
+    if not banner_line:
+        print("[*] Paste ONE line from banners and press Enter:")
+        banner_line = sys.stdin.readline().strip()
     if not banner_line:
         print("[-] Empty input")
         sys.exit(1)
@@ -148,21 +255,22 @@ def main():
     info = parse_banner(banner_line)
     print(f"[+] Parsed: {info}")
 
-    url = build_debuginfo_url(info)
+    url = build_debuginfo_url(info, provider=args.provider, base_url=args.debuginfo_base_url)
 
-    workdir = Path("./symbol_work")
-    workdir.mkdir(parents=True, exist_ok=True)  # FIX: create workdir early
+    workdir = Path(args.workdir)
+    kernel_workdir = workdir / info["kernel"]
+    kernel_workdir.mkdir(parents=True, exist_ok=True)
 
-    rpm_path = workdir / url.split("/")[-1]
+    rpm_path = kernel_workdir / url.split("/")[-1]
     rpm_path = download(url, rpm_path)
 
-    extract_dir = workdir / "extract"
+    extract_dir = kernel_workdir / "extract"
     extract_rpm(rpm_path, extract_dir)
 
     vmlinux = find_vmlinux(extract_dir)
 
     # Volatility symbols directory: assume script run from volatility3 root
-    vol_symbols_root = Path("./symbols")
+    vol_symbols_root = Path(args.symbols_dir)
     out_json = build_symbols(dwarf2json_path, vmlinux, info["kernel"], vol_symbols_root)
 
     print("\nDONE")
